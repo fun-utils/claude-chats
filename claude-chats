@@ -1,0 +1,1109 @@
+#!/usr/bin/env bash
+# claude-chats - browse, search, move, fork, symlink Claude Code chats and show them in Claude Desktop.
+# A pure bash full-screen app (mouse, right-click menus, pop-ups) in the style of gsecrets. No Python, no uv.
+# Needs: Linux, bash 5+, gawk, jq, GNU find, sort. Optional: rg (search words inside chats), xclip/wl-copy (copy id).
+#
+#   claude-chats                     the app
+#   claude-chats list [folder]       plain list (newest first), optionally only chats of one folder
+#   claude-chats move <id> <folder>  move a chat to another project folder (rewrites its ids and paths)
+#   claude-chats fork <id> [folder]  copy a chat under a new id, same folder or another one
+#   claude-chats link <id> <folder>  symlink a chat into another project folder (same id, both work)
+#   claude-chats desktop-add <id>    show a chat in Claude Desktop (quit + reopen the app afterwards)
+#   claude-chats desktop-rm <id>     remove a chat from Claude Desktop (the transcript stays)
+#
+# Env: CLAUDE_CONFIG_DIR (default ~/.claude), CLAUDE_CHATS_DESKTOP_DIR (default ~/.config/Claude/claude-code-sessions),
+#      CLAUDE_CHATS_INDEX (cache file, default ~/.cache/claude-chats/index.tsv)
+set -u
+
+PROJECTS_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
+DESKTOP_DIR=${CLAUDE_CHATS_DESKTOP_DIR:-$HOME/.config/Claude/claude-code-sessions}
+INDEX_FILE=${CLAUDE_CHATS_INDEX:-$HOME/.cache/claude-chats/index.tsv}
+FS=$'\x1f'                                             # field separator of the index (never appears in text)
+INDEX_VERSION='claude-chats index 2'                   # first line of the index; bump it when the scanner changes so old caches get rebuilt
+ESCAPE_WAIT=0.05
+
+# =============================================================================== colors and terminal
+
+ESC=$'\e'; RESET="${ESC}[0m"; BOLD="${ESC}[1m"; REVERSE="${ESC}[7m"
+
+# Palette: 256 colors (every terminal has them). Every style carries its own background, so the whole
+# screen is repainted every frame and no color ever bleeds into the next cell.
+C_APP="${ESC}[48;5;233m"                                  # the desk behind the cards
+C_CARD="${ESC}[48;5;236m"                                 # a card
+C_TEXT="${ESC}[48;5;236;38;5;252m"
+C_DIM="${ESC}[48;5;236;38;5;246m"
+C_FAINT="${ESC}[48;5;236;38;5;242m"
+C_HEAD="${ESC}[48;5;236;38;5;110;1m"                      # column titles
+C_ACCENT="${ESC}[48;5;236;38;5;111;1m"
+C_TITLE="${ESC}[48;5;236;38;5;255;1m"
+C_LINE="${ESC}[48;5;236;38;5;238m"                        # card border, resting
+C_LINE_FOCUS="${ESC}[48;5;236;38;5;111m"                  # card border, the pane you are in
+C_CHIP="${ESC}[48;5;111;38;5;235;1m"                      # card title pill
+C_CHIP_DIM="${ESC}[48;5;240;38;5;250m"
+C_CHIP_WARM="${ESC}[48;5;179;38;5;235;1m"
+C_ROW_SEL="${ESC}[48;5;238;38;5;252m"                     # selected row, pane not focused
+C_ROW_FOCUS="${ESC}[48;5;25;38;5;231;1m"                  # selected row, pane focused
+C_SCROLL="${ESC}[48;5;236;38;5;238m"; C_SCROLL_THUMB="${ESC}[48;5;236;38;5;111m"
+C_BTN="${ESC}[48;5;239;38;5;252m"; C_BTN_PRIMARY="${ESC}[48;5;68;38;5;231;1m"
+C_BTN_SUCCESS="${ESC}[48;5;71;38;5;231;1m"; C_BTN_DANGER="${ESC}[48;5;131;38;5;231;1m"
+C_BAR="${ESC}[48;5;232;38;5;249m"                         # top bar and the two bottom rows
+C_LOGO="${ESC}[48;5;111;38;5;233;1m"
+C_TAB="${ESC}[48;5;236;38;5;248m"; C_TAB_ON="${ESC}[48;5;111;38;5;235;1m"
+C_STATUS="${ESC}[48;5;232;38;5;180m"; C_STATUS_MARK="${ESC}[48;5;232;38;5;111m"
+C_HINT="${ESC}[48;5;232;38;5;242m"; C_KEY="${ESC}[48;5;232;38;5;252;1m"
+C_SHADOW="${ESC}[48;5;232m"
+C_FIELD="${ESC}[48;5;237;38;5;250m"; C_FIELD_FOCUS="${ESC}[48;5;238;38;5;231m"
+C_MENU="${ESC}[48;5;238;38;5;252m"; C_MENU_SEL="${ESC}[48;5;111;38;5;235;1m"; C_MENU_LINE="${ESC}[48;5;238;38;5;243m"
+C_FOLDER="${ESC}[48;5;236;38;5;179m"                      # folder rows
+C_MARK="${ESC}[48;5;236;38;5;111m"                        # the ◆ / ↗ marks on a row
+SPACES=$(printf '%400s')
+TUI_ACTIVE=0; PREVIEW_SHOWN=1; READ_FAILURES=0; SAVED_STTY=$(stty -g 2>/dev/null || true)
+
+terminal_setup() { printf '\e[?1049h\e[?25l\e[?1000h\e[?1006h'; stty -echo -icanon 2>/dev/null; TUI_ACTIVE=1; update_size; }
+terminal_restore() { [ "$TUI_ACTIVE" = 1 ] || return 0; printf '\e[?1006l\e[?1000l\e[?25h\e[0m\e[?1049l'; [ -n "$SAVED_STTY" ] && stty "$SAVED_STTY" 2>/dev/null; TUI_ACTIVE=0; }
+update_size() {
+    read -r ROWS COLS < <(stty size 2>/dev/null) || { ROWS=24; COLS=80; }
+    [ "${ROWS:-0}" -ge 12 ] || ROWS=24; [ "${COLS:-0}" -ge 60 ] || COLS=80
+    BODY_Y=2; BODY_H=$((ROWS - 3)); STATUS_Y=$((ROWS - 1)); FOOTER_Y=$ROWS
+    if [ "$PREVIEW_SHOWN" = 1 ] && [ "$COLS" -ge 100 ]; then LEFT_W=$((COLS * 58 / 100)); else LEFT_W=$COLS; fi
+    RIGHT_X=$((LEFT_W + 1)); RIGHT_W=$((COLS - LEFT_W))
+}
+TMP_FILE=$(mktemp)
+trap 'terminal_restore; rm -f "$TMP_FILE" "$TMP_FILE.err"' EXIT
+trap 'update_size' WINCH
+
+# =============================================================================== low level drawing
+
+SCREEN=''
+draw() { SCREEN+="$1"; }
+flush() { printf '%s' "$SCREEN"; SCREEN=''; }
+at() { draw "${ESC}[$1;$2H$3"; }                       # at ROW COL TEXT
+fit() { FIT=${1:0:$2}; FIT+=${SPACES:0:$(($2 - ${#FIT}))}; }   # fit TEXT WIDTH -> FIT (cut or padded to WIDTH)
+
+regions_clear() { REGION_X0=(); REGION_Y0=(); REGION_X1=(); REGION_Y1=(); REGION_ACTION=(); }
+region_add() { REGION_X0+=("$1"); REGION_Y0+=("$2"); REGION_X1+=("$3"); REGION_Y1+=("$4"); REGION_ACTION+=("$5"); }
+region_at() {                                          # region_at X Y -> HIT (first match wins)
+    local i; HIT=''
+    for ((i = 0; i < ${#REGION_ACTION[@]}; i++)); do
+        if [ "$1" -ge "${REGION_X0[$i]}" ] && [ "$1" -le "${REGION_X1[$i]}" ] && [ "$2" -ge "${REGION_Y0[$i]}" ] && [ "$2" -le "${REGION_Y1[$i]}" ]; then HIT=${REGION_ACTION[$i]}; return; fi
+    done
+}
+region_find() {                                        # region_find ACTION -> FOUND_X FOUND_Y (top-left corner of that region)
+    local i; FOUND_X=$((COLS / 2)); FOUND_Y=2
+    for ((i = 0; i < ${#REGION_ACTION[@]}; i++)); do [ "${REGION_ACTION[$i]}" = "$1" ] && { FOUND_X=${REGION_X0[$i]}; FOUND_Y=${REGION_Y0[$i]}; return; }; done
+}
+
+fill_screen() { local y; for ((y = 1; y <= ROWS; y++)); do fit '' "$COLS"; at "$y" 1 "${C_APP}${FIT}${RESET}"; done; }
+
+draw_card() {                                          # draw_card X Y WIDTH HEIGHT STYLE  - a rounded, filled card
+    local x=$1 y=$2 w=$3 h=$4 style=$5 i line
+    fit '' $((w - 2)); line=${FIT//' '/─}
+    at "$y" "$x" "${style}╭${line}╮${RESET}"
+    for ((i = 1; i < h - 1; i++)); do at $((y + i)) "$x" "${style}│${C_CARD}${SPACES:0:$((w - 2))}${style}│${RESET}"; done
+    at $((y + h - 1)) "$x" "${style}╰${line}╯${RESET}"
+}
+draw_shadow() {                                        # draw_shadow X Y WIDTH HEIGHT  - the soft drop shadow under a floating box
+    local x=$1 y=$2 w=$3 h=$4 i
+    for ((i = 1; i < h; i++)); do [ $((y + i)) -le "$ROWS" ] && [ $((x + w)) -lt "$COLS" ] && at $((y + i)) $((x + w)) "${C_SHADOW}  ${RESET}"; done
+    [ $((y + h)) -le "$ROWS" ] && { fit '' "$w"; at $((y + h)) $((x + 2)) "${C_SHADOW}${FIT}${RESET}"; }
+}
+draw_chip() { at "$1" "$2" "${4} ${3:0:${5:-200}} ${RESET}"; }   # draw_chip ROW COL TEXT STYLE [MAX_TEXT_WIDTH]  - a pill, used for card titles
+draw_rule() {                                          # draw_rule ROW X WIDTH LABEL LABEL_STYLE BORDER_STYLE  - a labelled divider inside a card
+    local line
+    fit '' $(($3 - 2)); line=${FIT//' '/─}
+    at "$1" "$2" "${6}├${line}┤${RESET}"
+    at "$1" $(($2 + 2)) "${5} $4 ${RESET}"
+}
+draw_text() { fit "$4" "$3"; at "$1" "$2" "${5:-$C_TEXT}${FIT}${RESET}"; }   # draw_text ROW COL WIDTH TEXT [STYLE]
+
+# draw_buttons ROW COL MAX_COL "id:Label:style|id:Label|..."  - pill buttons; styles: primary, success, danger; clicks give "btn:id"
+draw_buttons() {
+    local row=$1 col=$2 max_col=$3 start_col=$2 part id label style text
+    local old_ifs=$IFS; IFS='|'; set -- $4; IFS=$old_ifs
+    for part in "$@"; do
+        id=${part%%:*}; label=${part#*:}; style=${label#*:}; label=${label%%:*}; [ "$style" = "$label" ] && style=''
+        case $style in primary) style=$C_BTN_PRIMARY ;; success) style=$C_BTN_SUCCESS ;; danger) style=$C_BTN_DANGER ;; *) style=$C_BTN ;; esac
+        text=" $label "
+        if [ $((col + ${#text} - 1)) -gt "$max_col" ]; then row=$((row + 1)); col=$start_col; fi
+        at "$row" "$col" "${style}${text}${RESET}"
+        region_add "$col" "$row" $((col + ${#text} - 1)) "$row" "btn:$id"
+        col=$((col + ${#text} + 1))
+    done
+}
+measure_buttons() {                                    # measure_buttons SPEC -> BUTTONS_W
+    local part label total=0 old_ifs=$IFS
+    IFS='|'; set -- $1; IFS=$old_ifs
+    for part in "$@"; do label=${part#*:}; label=${label%%:*}; total=$((total + ${#label} + 3)); done
+    BUTTONS_W=$((total - 1))
+}
+draw_status() {
+    fit '' "$COLS"; at "$STATUS_Y" 1 "${C_BAR}${FIT}${RESET}"
+    at "$STATUS_Y" 2 "${C_STATUS_MARK}●${RESET}"
+    fit "$STATUS" $((COLS - 4)); at "$STATUS_Y" 4 "${C_STATUS}${FIT}${RESET}"
+}
+draw_hints() {                                         # draw_hints "key Label|key Label|..."  - the bottom strip, keys bright, labels dim
+    local part key label col=2
+    fit '' "$COLS"; at "$FOOTER_Y" 1 "${C_HINT}${FIT}${RESET}"
+    local old_ifs=$IFS; IFS='|'; set -- $1; IFS=$old_ifs
+    for part in "$@"; do
+        key=${part%% *}; label=${part#* }
+        [ $((col + ${#key} + ${#label} + 3)) -gt "$COLS" ] && break
+        at "$FOOTER_Y" "$col" "${C_KEY}${key}${RESET}${C_HINT} ${label}${RESET}"
+        col=$((col + ${#key} + ${#label} + 3))
+    done
+}
+show_loading() { STATUS="$1 ..."; [ "$TUI_ACTIVE" = 1 ] && { draw_status; flush; }; return 0; }
+
+# draw_list ROW COL WIDTH HEIGHT TOP SELECTED FOCUSED PREFIX  - rows from LIST_ROWS[], colors from LIST_STYLES[]; clicks give "PREFIX:index".
+# Draws a slim scrollbar with a bright thumb when the list is longer than the box.
+draw_list() {
+    local row=$1 col=$2 width=$3 height=$4 top=$5 selected=$6 focused=$7 prefix=$8
+    local i index style total=${#LIST_ROWS[@]} text_w=$3 thumb_top=0 thumb_h=0
+    if [ "$total" -gt "$height" ]; then
+        text_w=$((width - 1))
+        thumb_h=$((height * height / total)); [ "$thumb_h" -lt 1 ] && thumb_h=1
+        thumb_top=$((top * height / total)); [ $((thumb_top + thumb_h)) -gt "$height" ] && thumb_top=$((height - thumb_h))
+    fi
+    for ((i = 0; i < height; i++)); do
+        index=$((top + i)); style=$C_TEXT
+        if [ "$index" -lt "$total" ]; then
+            if [ "$index" = "$selected" ]; then if [ "$focused" = 1 ]; then style=$C_ROW_FOCUS; else style=$C_ROW_SEL; fi
+            else style=${LIST_STYLES[$index]:-$C_TEXT}; fi
+            draw_text $((row + i)) "$col" "$text_w" " ${LIST_ROWS[$index]}" "$style"
+            region_add "$col" $((row + i)) $((col + width - 1)) $((row + i)) "$prefix:$index"
+        else draw_text $((row + i)) "$col" "$text_w" '' "$C_TEXT"; fi
+        if [ "$thumb_h" -gt 0 ]; then
+            if [ "$i" -ge "$thumb_top" ] && [ "$i" -lt $((thumb_top + thumb_h)) ]; then at $((row + i)) $((col + width - 1)) "${C_SCROLL_THUMB}┃${RESET}"
+            else at $((row + i)) $((col + width - 1)) "${C_SCROLL}│${RESET}"; fi
+        fi
+    done
+}
+scroll_to_show() { NEW_TOP=$2; [ "$1" -lt "$NEW_TOP" ] && NEW_TOP=$1; [ "$1" -ge $(($2 + $3)) ] && NEW_TOP=$(($1 - $3 + 1)); [ "$NEW_TOP" -lt 0 ] && NEW_TOP=0; }
+clamp() { CLAMPED=$1; [ "$CLAMPED" -ge "$2" ] && CLAMPED=$(($2 - 1)); [ "$CLAMPED" -lt 0 ] && CLAMPED=0; }
+
+wrap_text() {                                          # wrap_text TEXT WIDTH -> WRAPPED[] (word wrapped lines)
+    local width=$2 word line='' words=(); WRAPPED=()
+    read -ra words <<< "$1"
+    for word in "${words[@]}"; do
+        if [ -z "$line" ]; then line=$word
+        elif [ $((${#line} + 1 + ${#word})) -le "$width" ]; then line+=" $word"
+        else WRAPPED+=("$line"); line=$word; fi
+        while [ ${#line} -gt "$width" ]; do WRAPPED+=("${line:0:$width}"); line=${line:$width}; done
+    done
+    [ -n "$line" ] && WRAPPED+=("$line")
+    return 0
+}
+
+# =============================================================================== keyboard and mouse
+
+# Sets KEY: a character, enter, backspace, esc, tab, shifttab, up, down, left, right, pgup, pgdn, home, end, f5,
+# click / rightclick / wheelup / wheeldown (with MOUSE_X, MOUSE_Y) or none.
+PENDING_CHAR=''                                        # a key that came right after a lone Esc; handed out by the next read_key
+read_key() {
+    local char rest sequence button
+    KEY=none
+    if [ -n "$PENDING_CHAR" ]; then char=$PENDING_CHAR; PENDING_CHAR=''
+    else IFS= read -rsn1 char || { READ_FAILURES=$((READ_FAILURES + 1)); [ "$READ_FAILURES" -gt 100 ] && exit 1; return; }; fi
+    READ_FAILURES=0
+    case $char in
+        '') KEY=enter ;;
+        $'\t') KEY=tab ;;
+        $'\x7f' | $'\b') KEY=backspace ;;
+        "$ESC")
+            IFS= read -rsn1 -t "$ESCAPE_WAIT" rest || { KEY=esc; return; }
+            [ "$rest" = O ] && rest='['
+            [ "$rest" = '[' ] || { KEY=esc; PENDING_CHAR=$rest; return; }   # Esc quickly followed by a key: both count
+            IFS= read -rsn1 -t "$ESCAPE_WAIT" rest || return
+            case $rest in
+                A) KEY=up ;;  B) KEY=down ;;  C) KEY=right ;;  D) KEY=left ;;  H) KEY=home ;;  F) KEY=end ;;  Z) KEY=shifttab ;;
+                1) IFS= read -rsn1 -t "$ESCAPE_WAIT" rest; KEY=home
+                   [ "$rest" = 5 ] && { IFS= read -rsn1 -t "$ESCAPE_WAIT" rest; KEY=f5; } ;;
+                4) IFS= read -rsn1 -t "$ESCAPE_WAIT" rest; KEY=end ;;
+                5) IFS= read -rsn1 -t "$ESCAPE_WAIT" rest; KEY=pgup ;;
+                6) IFS= read -rsn1 -t "$ESCAPE_WAIT" rest; KEY=pgdn ;;
+                '<')                                              # SGR mouse report  <button;x;yM
+                    sequence=''
+                    while IFS= read -rsn1 -t "$ESCAPE_WAIT" rest; do case $rest in M | m) break ;; esac; sequence+=$rest; done
+                    IFS=';' read -r button MOUSE_X MOUSE_Y <<< "$sequence"
+                    mouse_event "${button:-0}" "$rest" ;;
+                M)                                                # old X10 mouse report: 3 raw bytes
+                    LC_ALL=C IFS= read -rsn3 -t "$ESCAPE_WAIT" rest || return
+                    button=$(( $(printf '%d' "'${rest:0:1}") - 32 ))
+                    MOUSE_X=$(( $(printf '%d' "'${rest:1:1}") - 32 )); MOUSE_Y=$(( $(printf '%d' "'${rest:2:1}") - 32 ))
+                    mouse_event "$button" M ;;
+            esac ;;
+        *) KEY=$char ;;
+    esac
+}
+mouse_event() {                                        # mouse_event BUTTON M|m  (only presses count)
+    [ "$2" = M ] || return 0; local button=$1
+    [ $((button & 32)) = 0 ] || return 0               # a drag, ignore
+    if [ $((button & 64)) != 0 ]; then if [ $((button & 1)) = 0 ]; then KEY=wheelup; else KEY=wheeldown; fi
+    else case $((button & 3)) in 0) KEY=click ;; 2) KEY=rightclick ;; esac; fi
+}
+
+# =============================================================================== dialogs (pop-ups)
+
+dialog_frame() {                                       # dialog_frame TITLE WIDTH HEIGHT -> DLG_X DLG_Y  - a centered floating card with a title pill and a shadow
+    local w=$2 h=$3
+    DLG_X=$(((COLS - w) / 2 + 1)); DLG_Y=$(((ROWS - h) / 2 + 1)); [ "$DLG_Y" -lt 2 ] && DLG_Y=2
+    draw_shadow "$DLG_X" "$DLG_Y" "$w" "$h"
+    draw_card "$DLG_X" "$DLG_Y" "$w" "$h" "$C_LINE_FOCUS"
+    draw_chip "$DLG_Y" $((DLG_X + 2)) "$1" "$C_CHIP" $((w - 8))
+}
+confirm() {                                            # confirm TITLE BODY -> 0 = yes
+    local w h i
+    w=$((COLS - 8)); [ "$w" -gt 78 ] && w=78
+    wrap_text "$2" $((w - 6)); h=$((${#WRAPPED[@]} + 5))
+    dialog_frame "$1" "$w" "$h"
+    for ((i = 0; i < ${#WRAPPED[@]}; i++)); do draw_text $((DLG_Y + 2 + i)) $((DLG_X + 3)) $((w - 5)) "${WRAPPED[$i]}" "$C_TEXT"; done
+    regions_clear; draw_buttons $((DLG_Y + h - 2)) $((DLG_X + 3)) "$COLS" "yes:Yes, do it:success|no:Cancel"
+    flush
+    while :; do
+        read_key
+        case $KEY in
+            y | Y | enter) return 0 ;;
+            n | N | esc | q) return 1 ;;
+            click) region_at "$MOUSE_X" "$MOUSE_Y"; case $HIT in btn:yes) return 0 ;; btn:no) return 1 ;; esac ;;
+        esac
+    done
+}
+ask() {                                                # ask TITLE LABEL [HINT] -> REPLY (empty when cancelled); readline editing and paste work
+    local w=$((COLS - 8)); [ "$w" -gt 78 ] && w=78
+    dialog_frame "$1" "$w" 6
+    [ -n "${3:-}" ] && draw_text $((DLG_Y + 3)) $((DLG_X + 3)) $((w - 5)) "$3" "$C_FAINT"
+    draw_text $((DLG_Y + 2)) $((DLG_X + 2)) $((w - 4)) '' "$C_FIELD_FOCUS"
+    flush
+    printf '\e[?1000l\e[?1006l\e[?25h\e[%d;%dH' $((DLG_Y + 2)) $((DLG_X + 2))
+    stty echo icanon 2>/dev/null
+    IFS= read -r -e -p " $2: " REPLY || REPLY=''
+    stty -echo -icanon 2>/dev/null
+    printf '\e[?25l\e[?1000h\e[?1006h'
+}
+
+# info_box TITLE  - shows INFO_LINES[] in a centered card (scroll with keys or the wheel). Any other key, Close or a click outside closes it.
+info_box() {
+    local w=$((COLS - 8)) h x y top=0
+    [ "$w" -gt 100 ] && w=100
+    h=$((${#INFO_LINES[@]} + 5)); [ "$h" -gt $((ROWS - 4)) ] && h=$((ROWS - 4))
+    x=$(((COLS - w) / 2 + 1)); y=$(((ROWS - h) / 2 + 1)); [ "$y" -lt 2 ] && y=2
+    LIST_ROWS=("${INFO_LINES[@]}"); LIST_STYLES=()
+    while :; do
+        regions_clear
+        draw_shadow "$x" "$y" "$w" "$h"
+        draw_card "$x" "$y" "$w" "$h" "$C_LINE_FOCUS"; draw_chip "$y" $((x + 2)) "$1" "$C_CHIP" $((w - 8))
+        draw_list $((y + 2)) $((x + 2)) $((w - 4)) $((h - 4)) "$top" -1 0 line
+        draw_buttons $((y + h - 2)) $((x + 3)) $((x + w - 2)) "close:Close:primary"
+        flush; read_key
+        case $KEY in
+            up | wheelup) top=$((top - 1)) ;;  down | wheeldown) top=$((top + 1)) ;;  pgup) top=$((top - h)) ;;  pgdn) top=$((top + h)) ;;
+            click | rightclick) region_at "$MOUSE_X" "$MOUSE_Y"; case $HIT in line:*) ;; *) return ;; esac ;;
+            none) ;;
+            *) return ;;
+        esac
+        [ "$top" -gt $((${#LIST_ROWS[@]} - h + 4)) ] && top=$((${#LIST_ROWS[@]} - h + 4)); [ "$top" -lt 0 ] && top=0
+    done
+}
+info_wrapped() {                                       # info_wrapped TITLE TEXT... - one info_box, every argument word wrapped ('' = empty line)
+    local text width=$((COLS - 14)); [ "$width" -gt 96 ] && width=96
+    INFO_LINES=()
+    for text in "${@:2}"; do
+        if [ -z "$text" ]; then INFO_LINES+=(''); continue; fi
+        wrap_text "$text" "$width"; INFO_LINES+=("${WRAPPED[@]}")
+    done
+    info_box "$1"
+}
+
+# popup_menu X Y "id:Label|-:|id:Label|..." -> MENU_ID. Returns 1 when closed without a choice. "-" draws a divider.
+# Hotkey of an item: its id when that is one letter, else the first letter of its id when no other item starts with it.
+popup_menu() {
+    local x=$1 y=$2 ids=() labels=() hotkeys=() part id w=0 h n selected=0 i j row style
+    local old_ifs=$IFS; IFS='|'; set -- $3; IFS=$old_ifs
+    for part in "$@"; do ids+=("${part%%:*}"); labels+=("${part#*:}"); done
+    n=${#ids[@]}
+    for ((i = 0; i < n; i++)); do
+        id=${ids[$i]:0:1}; [ "${ids[$i]}" = '-' ] && id=''
+        for ((j = 0; j < n; j++)); do [ "$j" != "$i" ] && [ "${ids[$j]:0:1}" = "$id" ] && id=''; done
+        hotkeys+=("$id"); [ ${#labels[$i]} -gt "$w" ] && w=${#labels[$i]}
+    done
+    while [ "$selected" -lt $((n - 1)) ] && [ "${ids[$selected]}" = '-' ]; do selected=$((selected + 1)); done
+    w=$((w + 8)); h=$((n + 2))
+    [ $((x + w)) -gt "$COLS" ] && x=$((COLS - w)); [ $((y + h)) -gt "$ROWS" ] && y=$((ROWS - h)); [ "$x" -lt 1 ] && x=1; [ "$y" -lt 2 ] && y=2
+    while :; do
+        regions_clear; draw_shadow "$x" "$y" "$w" "$h"
+        fit '' $((w - 2)); at "$y" "$x" "${C_MENU_LINE}╭${FIT//' '/─}╮${RESET}"
+        for ((i = 0; i < n; i++)); do
+            row=$((y + 1 + i))
+            at "$row" "$x" "${C_MENU_LINE}│${RESET}"; at "$row" $((x + w - 1)) "${C_MENU_LINE}│${RESET}"
+            if [ "${ids[$i]}" = '-' ]; then fit '' $((w - 2)); at "$row" $((x + 1)) "${C_MENU_LINE}${FIT//' '/┈}${RESET}"; continue; fi
+            if [ "$i" = "$selected" ]; then style=$C_MENU_SEL; else style=$C_MENU; fi
+            printf -v part ' %s  %s' "${hotkeys[$i]:- }" "${labels[$i]}"
+            draw_text "$row" $((x + 1)) $((w - 2)) "$part" "$style"
+            region_add $((x + 1)) "$row" $((x + w - 2)) "$row" "item:$i"
+        done
+        fit '' $((w - 2)); at $((y + h - 1)) "$x" "${C_MENU_LINE}╰${FIT//' '/─}╯${RESET}"
+        flush; read_key
+        case $KEY in
+            up | wheelup) selected=$((selected - 1)); while [ "$selected" -gt 0 ] && [ "${ids[$selected]}" = '-' ]; do selected=$((selected - 1)); done ;;
+            down | wheeldown) selected=$((selected + 1)); while [ "$selected" -lt $((n - 1)) ] && [ "${ids[$selected]}" = '-' ]; do selected=$((selected + 1)); done ;;
+            home) selected=0 ;;  end) selected=$((n - 1)) ;;
+            esc | q) return 1 ;;
+            enter) [ "${ids[$selected]}" = '-' ] && continue; MENU_ID=${ids[$selected]}; return 0 ;;
+            click | rightclick) region_at "$MOUSE_X" "$MOUSE_Y"
+                 case $HIT in item:*) [ "${ids[${HIT#item:}]}" = '-' ] && continue; MENU_ID=${ids[${HIT#item:}]}; return 0 ;; *) return 1 ;; esac ;;
+            none) ;;
+            *) for ((i = 0; i < n; i++)); do [ -n "${hotkeys[$i]}" ] && [ "${hotkeys[$i]}" = "$KEY" ] && { MENU_ID=${ids[$i]}; return 0; }; done ;;
+        esac
+        clamp "$selected" "$n"; selected=$CLAMPED
+    done
+}
+
+# picker TITLE  - a searchable list in a floating card. Items from PICK_LABELS[] / PICK_IDS[]. Result: PICK_ID. Returns 1 when cancelled.
+picker() {
+    local title=$1 filter='' selected=0 top=0 i x y w h list_h visible=() index line
+    w=$((COLS - 10)); [ "$w" -gt 100 ] && w=100; h=$((ROWS - 6)); [ "$h" -gt 30 ] && h=30
+    x=$(((COLS - w) / 2 + 1)); y=$(((ROWS - h) / 2 + 1)); [ "$y" -lt 2 ] && y=2; list_h=$((h - 5))
+    while :; do
+        visible=(); shopt -s nocasematch
+        for ((i = 0; i < ${#PICK_LABELS[@]}; i++)); do [[ ${PICK_LABELS[$i]} == *"$filter"* ]] && visible+=("$i"); done
+        shopt -u nocasematch
+        clamp "$selected" "${#visible[@]}"; selected=$CLAMPED
+        scroll_to_show "$selected" "$top" "$list_h"; top=$NEW_TOP
+        regions_clear
+        draw_shadow "$x" "$y" "$w" "$h"
+        draw_card "$x" "$y" "$w" "$h" "$C_LINE_FOCUS"; draw_chip "$y" $((x + 2)) "$title" "$C_CHIP" $((w - 8))
+        printf -v line ' SEARCH   %s▌' "$filter"
+        draw_text $((y + 1)) $((x + 2)) $((w - 4)) "$line" "$C_FIELD_FOCUS"
+        LIST_ROWS=(); LIST_STYLES=()
+        for index in "${visible[@]}"; do LIST_ROWS+=("${PICK_LABELS[$index]}"); done
+        draw_list $((y + 2)) $((x + 2)) $((w - 4)) "$list_h" "$top" "$selected" 1 row
+        draw_buttons $((y + h - 2)) $((x + 3)) $((x + w - 2)) "ok:Choose:success|cancel:Cancel"
+        draw_text $((y + h - 2)) $((x + 24)) $((w - 26)) "Enter or a second click chooses · type to search · Esc cancels" "$C_FAINT"
+        flush; read_key
+        case $KEY in
+            up) selected=$((selected - 1)) ;;  down) selected=$((selected + 1)) ;;
+            pgup) selected=$((selected - list_h)) ;;  pgdn) selected=$((selected + list_h)) ;;
+            wheelup) selected=$((selected - 3)) ;;  wheeldown) selected=$((selected + 3)) ;;
+            home) selected=0 ;;  end) selected=$((${#visible[@]} - 1)) ;;
+            backspace) filter=${filter%?} ;;
+            esc) return 1 ;;
+            enter) [ "${#visible[@]}" -gt 0 ] || continue; PICK_ID=${PICK_IDS[${visible[$selected]}]}; return 0 ;;
+            click) region_at "$MOUSE_X" "$MOUSE_Y"
+                 case $HIT in
+                     row:*) index=${HIT#row:}
+                            if [ "$index" = "$selected" ]; then PICK_ID=${PICK_IDS[${visible[$selected]}]}; return 0; else selected=$index; fi ;;
+                     btn:ok) [ "${#visible[@]}" -gt 0 ] || continue; PICK_ID=${PICK_IDS[${visible[$selected]}]}; return 0 ;;
+                     btn:cancel) return 1 ;;
+                 esac ;;
+            rightclick | none | tab | shifttab | left | right | f5) ;;
+            ?) filter+=$KEY; selected=0 ;;
+        esac
+    done
+}
+
+copy_to_clipboard() {
+    if command -v pbcopy >/dev/null; then printf '%s' "$1" | pbcopy
+    elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null; then printf '%s' "$1" | wl-copy
+    elif command -v xclip >/dev/null; then printf '%s' "$1" | xclip -selection clipboard
+    elif command -v xsel >/dev/null; then printf '%s' "$1" | xsel --clipboard --input
+    else printf '\e]52;c;%s\a' "$(printf '%s' "$1" | base64 | tr -d '\n')"; fi
+}
+
+# =============================================================================== reading the chats (index)
+
+# One gawk pass per transcript prints: path, folder, entrypoint, first timestamp, last timestamp, prompt count, title, first prompt, last answer.
+AWK_SCAN='
+function json_text(s,    t) {
+    s = substr(s, 1, 700)
+    match(s, /^([^"\\]|\\.)*/); t = substr(s, 1, RLENGTH)
+    gsub(/\\n|\\t|\\r/, " ", t); gsub(/\\"/, "\"", t); gsub(/\\\\/, "\\", t); gsub(/[\t\n\x1f]/, " ", t)
+    return t
+}
+BEGINFILE { cwd = ""; entry = ""; first_ts = ""; last_ts = ""; ai_title = ""; custom_title = ""; prompts = 0; first_prompt = ""; last_answer = "" }
+{
+    if (cwd == "" && match($0, /"cwd":"[^"]*"/)) cwd = substr($0, RSTART + 7, RLENGTH - 8)
+    if (entry == "" && match($0, /"entrypoint":"[^"]*"/)) entry = substr($0, RSTART + 14, RLENGTH - 15)
+    if (match($0, /"timestamp":"[^"]*"/)) { last_ts = substr($0, RSTART + 13, RLENGTH - 14); if (first_ts == "") first_ts = last_ts }
+    if (index($0, "\"type\":\"ai-title\"") && match($0, /"aiTitle":"/)) ai_title = json_text(substr($0, RSTART + RLENGTH))
+    if (index($0, "\"type\":\"custom-title\"") && match($0, /"customTitle":"/)) custom_title = json_text(substr($0, RSTART + RLENGTH))
+    if (index($0, "\"type\":\"user\"") && !index($0, "\"tool_result\"") && !index($0, "\"isSidechain\":true")) {
+        text = ""
+        if (match($0, /"role":"user","content":("|\[\{"type":"text","text":")/)) text = substr($0, RSTART + RLENGTH, 24)
+        if (text !~ /^<(command-name|local-command|bash-)/) {            # slash commands and their caveats are not real prompts
+            prompts++
+            if (first_prompt == "" && text != "") first_prompt = json_text(substr($0, RSTART + RLENGTH))
+        }
+    }
+    if (index($0, "\"type\":\"assistant\"") && match($0, /\{"type":"text","text":"/)) last_answer = json_text(substr($0, RSTART + RLENGTH))
+}
+ENDFILE {
+    title = custom_title; if (title == "") title = ai_title; if (title == "") title = substr(first_prompt, 1, 90); if (title == "") title = "(empty chat)"
+    printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%d\x1f%s\x1f%s\x1f%s\n", FILENAME, cwd, entry, first_ts, last_ts, prompts, title, substr(first_prompt, 1, 400), substr(last_answer, 1, 600)
+    fflush()
+}'
+
+# load_chats  - fills CHAT_*[] from the transcripts, rescanning only files whose size or time changed since the cached index
+load_chats() {
+    local line path mtime size rest cached_mtime cached_size i=0 index_lines=() to_scan=() id
+    local -A cached=() stat_of=() desktop_ids=()
+    show_loading "Scanning chats"
+    [ -f "$INDEX_FILE" ] && [ "$(head -n1 "$INDEX_FILE")" = "$INDEX_VERSION" ] && while IFS= read -r line; do cached[${line%%"$FS"*}]=$line; done < <(tail -n +2 "$INDEX_FILE")
+    while IFS=$'\t' read -r path mtime size; do
+        mtime=${mtime%%.*}; line=${cached[$path]:-}
+        if [ -n "$line" ]; then
+            IFS=$FS read -r _ cached_mtime cached_size _ <<< "$line"
+            [ "$cached_mtime" = "$mtime" ] && [ "$cached_size" = "$size" ] && { index_lines+=("$line"); continue; }
+        fi
+        to_scan+=("$path"); stat_of[$path]="$mtime$FS$size"
+    done < <(find -L "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl' -printf '%p\t%T@\t%s\n' 2>/dev/null)
+    if [ "${#to_scan[@]}" -gt 0 ]; then
+        show_loading "Reading ${#to_scan[@]} changed chats"
+        while IFS= read -r line; do path=${line%%"$FS"*}; rest=${line#*"$FS"}; index_lines+=("$path$FS${stat_of[$path]}$FS$rest"); done \
+            < <(printf '%s\0' "${to_scan[@]}" | xargs -0 -P "$(nproc 2>/dev/null || echo 2)" -n 40 gawk "$AWK_SCAN" 2>/dev/null)
+        mkdir -p "$(dirname "$INDEX_FILE")" && printf '%s\n' "$INDEX_VERSION" "${index_lines[@]}" > "$INDEX_FILE"
+    fi
+    while IFS= read -r id; do desktop_ids[$id]=1; done < <(desktop_grep -o '"cliSessionId": ?"[^"]+"' | sed -E 's/.*: ?"([^"]+)"/\1/')
+    CHAT_PATH=(); CHAT_ID=(); CHAT_FOLDER=(); CHAT_MADE=(); CHAT_FIRST_TS=(); CHAT_LAST_TS=(); CHAT_PROMPTS=(); CHAT_TITLE=(); CHAT_FIRST=(); CHAT_ANSWER=()
+    CHAT_SIZE=(); CHAT_SIZE_H=(); CHAT_LINK=(); CHAT_DESKTOP=()
+    for line in "${index_lines[@]}"; do
+        IFS=$FS read -r path mtime size rest <<< "$line"
+        CHAT_PATH+=("$path"); id=${path##*/}; id=${id%.jsonl}; CHAT_ID+=("$id"); CHAT_SIZE+=("$size")
+        IFS=$FS read -r "CHAT_FOLDER[$i]" "CHAT_MADE[$i]" "CHAT_FIRST_TS[$i]" "CHAT_LAST_TS[$i]" "CHAT_PROMPTS[$i]" "CHAT_TITLE[$i]" "CHAT_FIRST[$i]" "CHAT_ANSWER[$i]" <<< "$rest"
+        human_size "$size"; CHAT_SIZE_H+=("$HUMAN")
+        if [ -L "$path" ]; then CHAT_LINK+=(1); else CHAT_LINK+=(0); fi
+        CHAT_DESKTOP+=("${desktop_ids[$id]:-0}")
+        i=$((i + 1))
+    done
+    compute_when_labels; build_projects
+    STATUS="${#CHAT_PATH[@]} chats in $PROJECTS_DIR"
+}
+human_size() { if [ "$1" -ge 1073741824 ]; then HUMAN="$(($1 * 10 / 1073741824 / 10)).$(($1 * 10 / 1073741824 % 10))G"; elif [ "$1" -ge 1048576 ]; then HUMAN="$(($1 * 10 / 1048576 / 10)).$(($1 * 10 / 1048576 % 10))M"; elif [ "$1" -ge 1024 ]; then HUMAN="$(($1 / 1024))K"; else HUMAN="${1}B"; fi; }
+made_in() { case $1 in cli) MADE=terminal ;; claude-desktop) MADE=desktop ;; sdk*) MADE=sdk/acp ;; claude-vscode) MADE=vscode ;; local-agent) MADE=agent ;; '') MADE='?' ;; *) MADE=${1:0:8} ;; esac; }
+compute_when_labels() {                                # CHAT_WHEN[] like "Today 14:03", "Yesterday 09:10" or "2026-08-31" (one date call for all)
+    local i today yesterday labels=()
+    printf -v today '%(%Y-%m-%d)T' -1; printf -v yesterday '%(%Y-%m-%d)T' $((EPOCHSECONDS - 86400))
+    [ "${#CHAT_PATH[@]}" -gt 0 ] && mapfile -t labels < <(for i in "${CHAT_LAST_TS[@]}"; do printf '%s\n' "${i:-1970-01-01T00:00:00Z}"; done | date -f - '+%Y-%m-%d %H:%M' 2>/dev/null)
+    CHAT_WHEN=()
+    for ((i = 0; i < ${#CHAT_PATH[@]}; i++)); do
+        if [ -z "${CHAT_LAST_TS[$i]}" ]; then CHAT_WHEN+=('?'); continue; fi
+        if [ "${#labels[@]}" != "${#CHAT_PATH[@]}" ]; then CHAT_WHEN+=("${CHAT_LAST_TS[$i]:0:10}"); continue; fi
+        case ${labels[$i]} in
+            "$today "*) CHAT_WHEN+=("Today ${labels[$i]#* }") ;;
+            "$yesterday "*) CHAT_WHEN+=("Yesterday ${labels[$i]#* }") ;;
+            *) CHAT_WHEN+=("${labels[$i]%% *}") ;;
+        esac
+    done
+}
+build_projects() {                                     # PROJ_FOLDER[] PROJ_COUNT[] PROJ_LAST[] PROJ_SIZE[] (one row per folder; "?" = no folder inside)
+    local i folder; local -A count=() last=() size=()
+    for ((i = 0; i < ${#CHAT_PATH[@]}; i++)); do
+        folder=${CHAT_FOLDER[$i]:-?}
+        count[$folder]=$((${count[$folder]:-0} + 1)); size[$folder]=$((${size[$folder]:-0} + CHAT_SIZE[i]))
+        [[ ${CHAT_LAST_TS[$i]} > ${last[$folder]:-} ]] && last[$folder]=${CHAT_LAST_TS[$i]}
+    done
+    PROJ_FOLDER=(); PROJ_COUNT=(); PROJ_LAST=(); PROJ_SIZE=()
+    for folder in "${!count[@]}"; do PROJ_FOLDER+=("$folder"); PROJ_COUNT+=("${count[$folder]}"); PROJ_LAST+=("${last[$folder]:-}"); PROJ_SIZE+=("${size[$folder]}"); done
+}
+chat_index_of() {                                      # chat_index_of ID -> CHAT_INDEX (the real file wins over symlinks with the same id)
+    local i best=''; CHAT_INDEX=''
+    for ((i = 0; i < ${#CHAT_PATH[@]}; i++)); do [ "${CHAT_ID[$i]}" = "$1" ] || continue; if [ "${CHAT_LINK[$i]}" = 0 ]; then CHAT_INDEX=$i; return 0; fi; best=$i; done
+    CHAT_INDEX=$best; [ -n "$best" ]
+}
+short_folder() { case $1 in "$HOME") SHORT='~' ;; "$HOME"/*) SHORT="~${1#"$HOME"}" ;; '') SHORT='?' ;; *) SHORT=$1 ;; esac; }
+encode_folder() { ENCODED=$(printf '%s' "$1" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g'); }   # the CLI's project dir name for a folder
+new_uuid() { UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid); UUID=${UUID,,}; }
+to_millis() {                                          # to_millis ISO_TIMESTAMP -> MILLIS
+    local seconds fraction=000
+    seconds=$(date -u -d "$1" +%s 2>/dev/null) || return 1
+    case $1 in *.*) fraction=${1#*.}; fraction=${fraction%%[!0-9]*}; fraction="${fraction}000"; fraction=${fraction:0:3} ;; esac
+    MILLIS=$((seconds * 1000 + 10#$fraction))
+}
+
+# =============================================================================== the operations (move, fork, link, desktop)
+# Each returns 1 with OP_ERROR set when it fails, and puts a one-line result in OP_RESULT.
+
+# rewrite_transcript SRC DST NEW_ID OLD_FOLDER NEW_FOLDER  - copies the transcript with every sessionId replaced and every cwd moved
+rewrite_transcript() {
+    jq -c --arg id "$3" --arg old "$4" --arg new "$5" '
+        walk(if type == "object" then
+                 (if (.sessionId | type) == "string" then .sessionId = $id else . end)
+                 | (if (.cwd | type) == "string" and $old != "" and (.cwd == $old or (.cwd | startswith($old + "/"))) then .cwd = $new + .cwd[($old | length):] else . end)
+             else . end)' "$1" > "$TMP_FILE" 2>"$TMP_FILE.err" || { OP_ERROR="Could not rewrite $1: $(head -c 300 "$TMP_FILE.err")"; return 1; }
+    cp "$TMP_FILE" "$2" && touch -r "$1" "$2"; : > "$TMP_FILE"
+}
+forget_in_session_cache() {                            # forget_in_session_cache PROJECT_DIR PATH  - drops the CLI's cache entry of a moved file
+    local cache=$1/.session_cache.json
+    [ -f "$cache" ] || return 0
+    jq -c --arg path "$2" 'if (.entries | type) == "object" then del(.entries[$path]) else . end' "$cache" > "$TMP_FILE" 2>/dev/null && cp "$TMP_FILE" "$cache"; : > "$TMP_FILE"
+}
+target_dir_for() {                                     # target_dir_for FOLDER -> TARGET_DIR (created)
+    [[ $1 == /* ]] || { OP_ERROR="The folder must be an absolute path: $1"; return 1; }
+    encode_folder "$1"; TARGET_DIR=$PROJECTS_DIR/$ENCODED; mkdir -p "$TARGET_DIR"
+}
+move_chat() {                                          # move_chat INDEX NEW_FOLDER
+    local i=$1 folder=${2%/} src dst sidecar record
+    src=${CHAT_PATH[$i]}; target_dir_for "$folder" || return 1; dst=$TARGET_DIR/${CHAT_ID[$i]}.jsonl
+    [ "$src" = "$dst" ] && { OP_ERROR="The chat is already in $folder."; return 1; }
+    [ -e "$dst" ] && { OP_ERROR="There is already a chat with this id in $folder."; return 1; }
+    rewrite_transcript "$src" "$dst" "${CHAT_ID[$i]}" "${CHAT_FOLDER[$i]}" "$folder" || return 1
+    sidecar=${src%.jsonl}; [ -d "$sidecar" ] && mv "$sidecar" "${dst%.jsonl}"
+    rm -f "$src"; forget_in_session_cache "$(dirname "$src")" "$src"
+    for record in $(desktop_records_for "${CHAT_ID[$i]}"); do
+        jq -c --arg cwd "$folder" '.cwd = $cwd | .originCwd = $cwd' "$record" > "$TMP_FILE" && cp "$TMP_FILE" "$record"; : > "$TMP_FILE"
+    done
+    OP_RESULT="Moved to $folder ($dst)."
+}
+fork_chat() {                                          # fork_chat INDEX [NEW_FOLDER]  -> NEW_ID
+    local i=$1 folder=${2:-${CHAT_FOLDER[$1]}} src dst sidecar
+    folder=${folder%/}; src=${CHAT_PATH[$i]}
+    [ -n "$folder" ] || { OP_ERROR="This chat has no folder inside; choose one to fork into."; return 1; }
+    target_dir_for "$folder" || return 1; new_uuid; NEW_ID=$UUID; dst=$TARGET_DIR/$NEW_ID.jsonl
+    rewrite_transcript "$src" "$dst" "$NEW_ID" "${CHAT_FOLDER[$i]}" "$folder" || return 1
+    sidecar=${src%.jsonl}; [ -d "$sidecar" ] && cp -a "$sidecar" "${dst%.jsonl}"
+    OP_RESULT="Forked as $NEW_ID in $folder. Resume it with: claude --resume $NEW_ID"
+}
+link_chat() {                                          # link_chat INDEX NEW_FOLDER
+    local i=$1 folder=${2%/} src dst sidecar real
+    src=${CHAT_PATH[$i]}; target_dir_for "$folder" || return 1; dst=$TARGET_DIR/${CHAT_ID[$i]}.jsonl
+    [ -e "$dst" ] && { OP_ERROR="There is already a chat with this id in $folder."; return 1; }
+    real=$(realpath "$src"); ln -s "$real" "$dst" || { OP_ERROR="Could not create the symlink $dst"; return 1; }
+    sidecar=${real%.jsonl}; [ -d "$sidecar" ] && ln -s "$sidecar" "${dst%.jsonl}"
+    OP_RESULT="Symlinked into $folder. 'claude --resume ${CHAT_ID[$i]}' now works there too."
+}
+# desktop_grep -o|-l PATTERN  - searches every Claude Desktop record (rg when installed, it is 10x faster than grep on these big files)
+desktop_grep() { if command -v rg >/dev/null; then rg "$1" -IN --no-messages -e "$2" "$DESKTOP_DIR" 2>/dev/null; else LC_ALL=C grep -rhE "$1" -e "$2" "$DESKTOP_DIR" 2>/dev/null; fi; }
+desktop_records_for() { desktop_grep -l "\"cliSessionId\": ?\"$1\""; }   # desktop_records_for ID -> file paths
+desktop_org_dirs() {                                   # -> ORG_DIRS[] (account/org dirs holding records, most recently used first)
+    mapfile -t ORG_DIRS < <(find "$DESKTOP_DIR" -mindepth 3 -maxdepth 3 -name 'local_*.json' -printf '%T@\t%h\n' 2>/dev/null | sort -rn | cut -f2 | awk '!seen[$0]++')
+}
+desktop_add() {                                        # desktop_add INDEX ORG_DIR
+    local i=$1 org=$2 template='' file created last id=${CHAT_ID[$1]} folder=${CHAT_FOLDER[$1]}
+    [ -n "$(desktop_records_for "$id")" ] && { OP_ERROR="Claude Desktop already shows this chat."; return 1; }
+    [ -n "$folder" ] && [ -n "${CHAT_FIRST_TS[$i]}" ] && [ -n "${CHAT_LAST_TS[$i]}" ] || { OP_ERROR="This chat has no folder or timestamps inside, Claude Desktop cannot show it."; return 1; }
+    while IFS= read -r file; do [ -z "$template" ] && template=$file; grep -qF "\"cwd\":\"$folder\"" "$file" && { template=$file; break; }; done \
+        < <(find "$org" -maxdepth 1 -name 'local_*.json' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2)
+    [ -n "$template" ] || { OP_ERROR="No existing Claude Desktop record in $org to copy the settings from."; return 1; }
+    to_millis "${CHAT_FIRST_TS[$i]}" && created=$MILLIS || { OP_ERROR="Bad start time: ${CHAT_FIRST_TS[$i]}"; return 1; }
+    to_millis "${CHAT_LAST_TS[$i]}" && last=$MILLIS || { OP_ERROR="Bad last time: ${CHAT_LAST_TS[$i]}"; return 1; }
+    new_uuid
+    jq -c --arg sid "local_$UUID" --arg cli "$id" --arg cwd "$folder" --arg title "${CHAT_TITLE[$i]}" --argjson created "$created" --argjson last "$last" '
+        . + {sessionId: $sid, cliSessionId: $cli, cwd: $cwd, originCwd: $cwd, title: $title, titleSource: "user", isArchived: false, completedTurns: 1,
+             createdAt: $created, lastActivityAt: $last, lastFocusedAt: $last, spawnSeed: {}, alwaysAllowedReasons: [], sessionPermissionUpdates: []}
+        | del(.lastSpawnRootDetected, .remoteControlAutoEligible, .priorCliSessionIds)' "$template" > "$TMP_FILE" \
+        || { OP_ERROR="Could not build the record from $template"; return 1; }
+    cp "$TMP_FILE" "$org/local_$UUID.json"; : > "$TMP_FILE"
+    OP_RESULT="Added to Claude Desktop ($org/local_$UUID.json). Quit and reopen Claude Desktop to see it."
+}
+desktop_rm() {                                         # desktop_rm ID
+    local files=(); mapfile -t files < <(desktop_records_for "$1")
+    [ "${#files[@]}" -gt 0 ] || { OP_ERROR="Claude Desktop does not show this chat."; return 1; }
+    rm -f "${files[@]}"; OP_RESULT="Removed from Claude Desktop (the transcript stays). Quit and reopen Claude Desktop."
+}
+chats_containing() {                                   # chats_containing "word word ..." -> INSIDE_HITS[path]=1 (every word must be inside the chat)
+    local words=() word files=()
+    INSIDE_HITS=(); read -ra words <<< "$1"; [ "${#words[@]}" -gt 0 ] || return 0
+    command -v rg >/dev/null || { STATUS="rg (ripgrep) is not installed, cannot search inside chats."; return 0; }
+    files=("${CHAT_PATH[@]}")
+    for word in "${words[@]}"; do
+        [ "${#files[@]}" -gt 0 ] || break
+        mapfile -t files < <(rg -l -i -F --no-messages -e "$word" -- "${files[@]}")
+    done
+    for word in "${files[@]}"; do INSIDE_HITS[$word]=1; done
+}
+
+# =============================================================================== the views (filter, sort, projects, tree)
+
+VIEW=chats; SEARCH=''; SEARCH_MODE=0; WORDS_INSIDE=0; PROJECT_FILTER=''; STATUS=''
+SORT_KEY=date; SORT_FLIP=0; PROJ_SORT_KEY=last; PROJ_SORT_FLIP=0
+VISIBLE=(); SEL_CHAT=0; TOP_CHAT=0; PROJ_VISIBLE=(); SEL_PROJ=0; TOP_PROJ=0; TREE_ROWS=(); TREE_KIND=(); TREE_KEY=(); SEL_TREE=0; TOP_TREE=0
+declare -A INSIDE_HITS=() FOLDED=()
+
+# sort_indexes ARRAY_NAME KEY_EXPRESSION FLAGS  - sorts an index array with sort(1); KEY_EXPRESSION is bash text using $i (the index)
+sort_indexes() {
+    local name=$1 flags=$3 line sorted=()
+    while IFS= read -r line; do sorted+=("${line#*$'\t'}"); done < <(
+        eval "local i key; for i in \"\${$name[@]}\"; do key=\"$2\"; printf '%s\t%s\n' \"\${key//\$'\t'/ }\" \"\$i\"; done" | LC_ALL=C sort -t $'\t' -k "1,1$flags" -k 2,2n)
+    eval "$name=(\"\${sorted[@]}\")"
+}
+flip_flags() { if [ "$1" = 1 ]; then case $FLAGS in *r*) FLAGS=${FLAGS//r/} ;; *) FLAGS+=r ;; esac; fi; }
+sort_chats() {
+    local expression
+    case $SORT_KEY in
+        date) expression='${CHAT_LAST_TS[$i]}'; FLAGS=r ;;  title) expression='${CHAT_TITLE[$i]}'; FLAGS=f ;;
+        project) expression='${CHAT_FOLDER[$i]}'; FLAGS=f ;;  size) expression='${CHAT_SIZE[$i]}'; FLAGS=nr ;;
+        msgs) expression='${CHAT_PROMPTS[$i]}'; FLAGS=nr ;;  made) expression='${CHAT_MADE[$i]}'; FLAGS=f ;;
+    esac
+    flip_flags "$SORT_FLIP"; sort_indexes VISIBLE "$expression" "$FLAGS"
+}
+apply_filter() {                                       # VISIBLE[] = chats matching the project filter and the search, sorted
+    local i ok word words=() hay; VISIBLE=()
+    read -ra words <<< "$SEARCH"; shopt -s nocasematch
+    for ((i = 0; i < ${#CHAT_PATH[@]}; i++)); do
+        if [ -n "$PROJECT_FILTER" ]; then
+            if [ "$PROJECT_FILTER" = '?' ]; then [ -z "${CHAT_FOLDER[$i]}" ] || continue
+            else [ "${CHAT_FOLDER[$i]}" = "$PROJECT_FILTER" ] || [[ ${CHAT_FOLDER[$i]} == "$PROJECT_FILTER"/* ]] || continue; fi
+        fi
+        if [ "$WORDS_INSIDE" = 1 ]; then [ "${#words[@]}" = 0 ] || [ -n "${INSIDE_HITS[${CHAT_PATH[$i]}]:-}" ] || continue
+        else
+            hay="${CHAT_TITLE[$i]} ${CHAT_FIRST[$i]} ${CHAT_FOLDER[$i]} ${CHAT_ID[$i]}"; ok=1
+            for word in "${words[@]}"; do [[ $hay == *"$word"* ]] || { ok=0; break; }; done
+            [ "$ok" = 1 ] || continue
+        fi
+        VISIBLE+=("$i")
+    done
+    shopt -u nocasematch
+    [ "${#VISIBLE[@]}" -gt 1 ] && sort_chats
+    clamp "$SEL_CHAT" "${#VISIBLE[@]}"; SEL_CHAT=$CLAMPED
+    sort_projects; build_tree
+}
+sort_projects() {
+    local expression i
+    PROJ_VISIBLE=(); for ((i = 0; i < ${#PROJ_FOLDER[@]}; i++)); do PROJ_VISIBLE+=("$i"); done
+    case $PROJ_SORT_KEY in
+        folder) expression='${PROJ_FOLDER[$i]}'; FLAGS=f ;;  chats) expression='${PROJ_COUNT[$i]}'; FLAGS=nr ;;
+        last) expression='${PROJ_LAST[$i]}'; FLAGS=r ;;  size) expression='${PROJ_SIZE[$i]}'; FLAGS=nr ;;
+    esac
+    flip_flags "$PROJ_SORT_FLIP"
+    [ "${#PROJ_VISIBLE[@]}" -gt 1 ] && sort_indexes PROJ_VISIBLE "$expression" "$FLAGS"
+    clamp "$SEL_PROJ" "${#PROJ_VISIBLE[@]}"; SEL_PROJ=$CLAMPED
+}
+# build_tree  - TREE_ROWS[] (text), TREE_KIND[] (folder|chat), TREE_KEY[] (folder path | chat index) from the folders of the VISIBLE chats.
+# Folders with nothing but one sub folder are shown together with it ("/home/abraun" instead of three rows).
+build_tree() {
+    local i node parent folder name depth indent skip='' chats_here=() ancestor; local -A under=() direct=() children=() shown_depth=()
+    for i in "${VISIBLE[@]}"; do
+        folder=${CHAT_FOLDER[$i]:-?}; direct[$folder]+="$i "; node=$folder
+        while :; do
+            [ -n "${under[$node]:-}" ] || { parent=${node%/*}; [ -n "$parent" ] || parent=/; [ "$node" = / ] || [ "$node" = '?' ] || children[$parent]=$((${children[$parent]:-0} + 1)); }
+            under[$node]=$((${under[$node]:-0} + 1)); [ "$node" = / ] || [ "$node" = '?' ] && break; node=${node%/*}; [ -n "$node" ] || node=/
+        done
+    done
+    TREE_ROWS=(); TREE_KIND=(); TREE_KEY=()
+    [ "${#under[@]}" -gt 0 ] && while IFS= read -r node; do
+        [ -n "$skip" ] && [[ $node == "$skip"/* ]] && continue
+        skip=''
+        [ "${children[$node]:-0}" = 1 ] && [ -z "${direct[$node]:-}" ] && continue        # only one sub folder inside: shown with that one
+        ancestor=$node; depth=0; name=$node
+        [ "$node" = '?' ] && { ancestor=/; name='(no folder inside)'; }
+        while [ "$ancestor" != / ]; do
+            ancestor=${ancestor%/*}; [ -n "$ancestor" ] || ancestor=/
+            [ -n "${shown_depth[$ancestor]:-}" ] && { depth=$((shown_depth[$ancestor] + 1)); [ "$ancestor" = / ] || name=${node#"$ancestor"/}; break; }
+        done
+        shown_depth[$node]=$depth
+        printf -v indent '%*s' $((depth * 2)) ''
+        if [ -n "${FOLDED[$node]:-}" ]; then TREE_ROWS+=("${indent}▸ $name  (${under[$node]})"); skip=$node
+        else TREE_ROWS+=("${indent}▾ $name  (${under[$node]})"); fi
+        TREE_KIND+=(folder); TREE_KEY+=("$node")
+        [ -n "$skip" ] && continue
+        read -ra chats_here <<< "${direct[$node]:-}"
+        for i in "${chats_here[@]}"; do TREE_ROWS+=("${indent}    · ${CHAT_TITLE[$i]}"); TREE_KIND+=(chat); TREE_KEY+=("$i"); done
+    done < <(printf '%s\n' "${!under[@]}" | sed 's,/,\x01,g' | LC_ALL=C sort | sed 's,\x01,/,g')
+    clamp "$SEL_TREE" "${#TREE_ROWS[@]}"; SEL_TREE=$CLAMPED
+}
+selected_chat() {                                      # -> SEL (index into CHAT_*) of the chat under the cursor, or empty
+    SEL=''
+    case $VIEW in
+        chats) [ "${#VISIBLE[@]}" -gt 0 ] && SEL=${VISIBLE[$SEL_CHAT]} ;;
+        tree) [ "${#TREE_ROWS[@]}" -gt 0 ] && [ "${TREE_KIND[$SEL_TREE]}" = chat ] && SEL=${TREE_KEY[$SEL_TREE]} ;;
+    esac
+    [ -n "$SEL" ]
+}
+pick_folder() {                                        # pick_folder TITLE -> PICKED_FOLDER; returns 1 when cancelled
+    local i; PICK_LABELS=('Type another folder path ...'); PICK_IDS=('')
+    for i in "${PROJ_VISIBLE[@]}"; do [ "${PROJ_FOLDER[$i]}" = '?' ] && continue; PICK_LABELS+=("$(printf '%-4s %s' "${PROJ_COUNT[$i]}" "${PROJ_FOLDER[$i]}")"); PICK_IDS+=("${PROJ_FOLDER[$i]}"); done
+    picker "$1" || return 1
+    PICKED_FOLDER=$PICK_ID
+    if [ -z "$PICKED_FOLDER" ]; then ask "$1" "Folder path" "Absolute path (~ is fine). Empty = cancel."; PICKED_FOLDER=${REPLY/#\~/$HOME}; fi
+    [ -n "$PICKED_FOLDER" ]
+}
+
+# =============================================================================== drawing the screen
+
+header_column() {                                      # header_column KEY LABEL WIDTH ROW COL ACTIVE_KEY ARROW PREFIX
+    local label=$2 style=$C_FAINT; [ "$3" -gt 0 ] || return 0
+    [ "$1" = "$6" ] && { label="$2 $7"; style=$C_HEAD; }
+    draw_text "$4" "$5" "$3" "${label:0:$3}" "$style"; region_add "$5" "$4" $(($5 + $3 - 1)) "$4" "$8:$1"
+}
+draw_search_row() {                                    # draw_search_row X Y WIDTH  - the search field inside the card, with the mode pill on its right
+    local x=$1 y=$2 w=$3 line pill pill_w
+    if [ "$WORDS_INSIDE" = 1 ]; then pill=' inside chats ▾ '; else pill=' titles ▾ '; fi
+    pill_w=${#pill}
+    if [ "$SEARCH_MODE" = 1 ]; then line=" SEARCH   ${SEARCH}▌"
+    elif [ -n "$SEARCH" ]; then line=" SEARCH   ${SEARCH}"
+    else line=' SEARCH   type / to search'; fi
+    if [ "$SEARCH_MODE" = 1 ] || [ -n "$SEARCH" ]; then draw_text "$y" "$x" $((w - pill_w - 1)) "$line" "$C_FIELD_FOCUS"
+    else draw_text "$y" "$x" $((w - pill_w - 1)) "$line" "$C_FAINT"; fi
+    region_add "$x" "$y" $((x + w - pill_w - 2)) "$y" search
+    if [ "$WORDS_INSIDE" = 1 ]; then at "$y" $((x + w - pill_w - 1)) "${C_CHIP_WARM}${pill}${RESET}"; else at "$y" $((x + w - pill_w - 1)) "${C_CHIP_DIM}${pill}${RESET}"; fi
+    region_add $((x + w - pill_w - 1)) "$y" $((x + w - 2)) "$y" btn:words
+}
+card_head() {                                          # card_head X Y WIDTH TITLE COUNT_TEXT  - title pill left, count pill right
+    draw_chip "$2" $(($1 + 2)) "$4" "$C_CHIP" $(($3 - 8))
+    [ -n "$5" ] && [ $((${#4} + ${#5} + 10)) -lt "$3" ] && at "$2" $(($1 + $3 - 3 - ${#5})) "${C_CHIP_DIM} $5 ${RESET}"
+}
+draw_chat_list() {                                     # draw_chat_list X Y W H
+    local x=$1 y=$2 w=$3 h=$4 i title_w line arrow project head col mark row_index
+    local proj_w=24 when_w=15 size_w=6 msgs_w=4 made_w=8 flags_w=3
+    [ "$w" -lt 96 ] && made_w=0; [ "$w" -lt 80 ] && proj_w=0
+    title_w=$((w - 6 - when_w - size_w - msgs_w - flags_w - 4)); [ "$proj_w" -gt 0 ] && title_w=$((title_w - proj_w - 1)); [ "$made_w" -gt 0 ] && title_w=$((title_w - made_w - 1))
+    draw_card "$x" "$y" "$w" "$h" "$C_LINE_FOCUS"
+    head="${#VISIBLE[@]} of ${#CHAT_PATH[@]}"; [ -n "$PROJECT_FILTER" ] && head+=" · filtered"
+    card_head "$x" "$y" "$w" 'Chats' "$head"
+    draw_search_row $((x + 2)) $((y + 1)) $((w - 3))
+    if [ "$SORT_FLIP" = 1 ]; then arrow='▲'; else arrow='▼'; fi
+    col=$((x + 3))
+    header_column title Title "$title_w" $((y + 2)) "$col" "$SORT_KEY" "$arrow" col; col=$((col + title_w + 1))
+    header_column project Project "$proj_w" $((y + 2)) "$col" "$SORT_KEY" "$arrow" col; [ "$proj_w" -gt 0 ] && col=$((col + proj_w + 1))
+    header_column date When "$when_w" $((y + 2)) "$col" "$SORT_KEY" "$arrow" col; col=$((col + when_w + 1))
+    header_column size Size "$size_w" $((y + 2)) "$col" "$SORT_KEY" "$arrow" col; col=$((col + size_w + 1))
+    header_column msgs Msgs "$msgs_w" $((y + 2)) "$col" "$SORT_KEY" "$arrow" col; col=$((col + msgs_w + 1))
+    header_column made Made "$made_w" $((y + 2)) "$col" "$SORT_KEY" "$arrow" col; [ "$made_w" -gt 0 ] && col=$((col + made_w + 1))
+    draw_text $((y + 2)) "$col" "$flags_w" '◆↗' "$C_FAINT"
+    LIST_ROWS=(); LIST_STYLES=(); ROW_MARK=()
+    for i in "${VISIBLE[@]}"; do
+        short_folder "${CHAT_FOLDER[$i]}"; project=$SHORT; [ "$proj_w" -gt 0 ] && [ ${#project} -gt "$proj_w" ] && project="…${project: -$((proj_w - 1))}"
+        made_in "${CHAT_MADE[$i]}"
+        printf -v line '%-*s ' "$title_w" "${CHAT_TITLE[$i]:0:$title_w}"
+        [ "$proj_w" -gt 0 ] && printf -v line '%s%-*s ' "$line" "$proj_w" "$project"
+        printf -v line '%s%-*s %*s %*s ' "$line" "$when_w" "${CHAT_WHEN[$i]}" "$size_w" "${CHAT_SIZE_H[$i]}" "$msgs_w" "${CHAT_PROMPTS[$i]}"
+        [ "$made_w" -gt 0 ] && printf -v line '%s%-*s ' "$line" "$made_w" "$MADE"
+        mark=''
+        [ "${CHAT_DESKTOP[$i]}" = 1 ] && mark='◆'
+        [ "${CHAT_LINK[$i]}" = 1 ] && mark+='↗'
+        LIST_ROWS+=("$line$mark"); LIST_STYLES+=("$C_TEXT"); ROW_MARK+=("$mark")
+    done
+    scroll_to_show "$SEL_CHAT" "$TOP_CHAT" $((h - 4)); TOP_CHAT=$NEW_TOP
+    draw_list $((y + 3)) $((x + 2)) $((w - 3)) $((h - 4)) "$TOP_CHAT" "$SEL_CHAT" 1 chat
+    for ((i = 0; i < h - 4; i++)); do                   # the ◆ / ↗ marks get their own color, so the rest of the row stays calm
+        row_index=$((TOP_CHAT + i)); [ "$row_index" -lt "${#LIST_ROWS[@]}" ] || break
+        [ "$row_index" = "$SEL_CHAT" ] && continue
+        [ -n "${ROW_MARK[$row_index]}" ] && at $((y + 3 + i)) "$col" "${C_MARK}${ROW_MARK[$row_index]}${RESET}"
+    done
+    [ "${#VISIBLE[@]}" = 0 ] && draw_text $((y + 3)) $((x + 2)) $((w - 3)) '   nothing matches this search' "$C_FAINT"
+}
+draw_project_list() {                                  # draw_project_list X Y W H
+    local x=$1 y=$2 w=$3 h=$4 i line arrow folder_w
+    folder_w=$((w - 34))
+    draw_card "$x" "$y" "$w" "$h" "$C_LINE_FOCUS"
+    card_head "$x" "$y" "$w" 'Projects' "${#PROJ_FOLDER[@]} folders"
+    draw_search_row $((x + 2)) $((y + 1)) $((w - 3))
+    if [ "$PROJ_SORT_FLIP" = 1 ]; then arrow='▲'; else arrow='▼'; fi
+    header_column folder Folder "$folder_w" $((y + 2)) $((x + 3)) "$PROJ_SORT_KEY" "$arrow" pcol
+    header_column chats Chats 6 $((y + 2)) $((x + 4 + folder_w)) "$PROJ_SORT_KEY" "$arrow" pcol
+    header_column last 'Last used' 12 $((y + 2)) $((x + 11 + folder_w)) "$PROJ_SORT_KEY" "$arrow" pcol
+    header_column size Size 7 $((y + 2)) $((x + 24 + folder_w)) "$PROJ_SORT_KEY" "$arrow" pcol
+    LIST_ROWS=(); LIST_STYLES=()
+    for i in "${PROJ_VISIBLE[@]}"; do
+        short_folder "${PROJ_FOLDER[$i]}"; [ "${PROJ_FOLDER[$i]}" = '?' ] && SHORT='(no folder inside)'
+        [ ${#SHORT} -gt "$folder_w" ] && SHORT="…${SHORT: -$((folder_w - 1))}"
+        human_size "${PROJ_SIZE[$i]}"
+        printf -v line '%-*s %6s %-12s %7s' "$folder_w" "$SHORT" "${PROJ_COUNT[$i]}" "${PROJ_LAST[$i]:0:10}" "$HUMAN"
+        LIST_ROWS+=("$line"); LIST_STYLES+=("$C_FOLDER")
+    done
+    scroll_to_show "$SEL_PROJ" "$TOP_PROJ" $((h - 4)); TOP_PROJ=$NEW_TOP
+    draw_list $((y + 3)) $((x + 2)) $((w - 3)) $((h - 4)) "$TOP_PROJ" "$SEL_PROJ" 1 proj
+}
+draw_tree() {                                          # draw_tree X Y W H
+    local x=$1 y=$2 w=$3 h=$4 i
+    draw_card "$x" "$y" "$w" "$h" "$C_LINE_FOCUS"
+    card_head "$x" "$y" "$w" 'Folder tree' "${#VISIBLE[@]} chats"
+    draw_search_row $((x + 2)) $((y + 1)) $((w - 3))
+    draw_text $((y + 2)) $((x + 3)) $((w - 5)) 'click a folder to fold it · Enter or right-click shows only its chats' "$C_FAINT"
+    LIST_ROWS=("${TREE_ROWS[@]}"); LIST_STYLES=()
+    for ((i = 0; i < ${#TREE_ROWS[@]}; i++)); do if [ "${TREE_KIND[$i]}" = folder ]; then LIST_STYLES+=("$C_FOLDER"); else LIST_STYLES+=("$C_TEXT"); fi; done
+    scroll_to_show "$SEL_TREE" "$TOP_TREE" $((h - 4)); TOP_TREE=$NEW_TOP
+    draw_list $((y + 3)) $((x + 2)) $((w - 3)) $((h - 4)) "$TOP_TREE" "$SEL_TREE" 1 tree
+}
+# The preview card is drawn row by row: PREV_LABEL[] (small, faint) + PREV_VALUE[], or a full-width PREV_VALUE with its own style.
+RULE_MARK=$'\x02'                                      # a PREV_LABEL of this value means "draw a labelled divider here"
+preview_add() { PREV_LABEL+=(''); PREV_VALUE+=("$1"); PREV_STYLE+=("${2:-$C_TEXT}"); }
+preview_field() { PREV_LABEL+=("$1"); PREV_VALUE+=("$2"); PREV_STYLE+=("$C_TEXT"); }
+preview_rule() { PREV_LABEL+=("$RULE_MARK"); PREV_VALUE+=("$1"); PREV_STYLE+=("$C_CHIP_DIM"); }
+preview_body() {                                       # preview_body TEXT WIDTH  - wrapped text, or a faint "(nothing)"
+    local l
+    [ -n "$1" ] || { preview_add '(nothing)' "$C_FAINT"; return; }
+    wrap_text "$1" "$2"; for l in "${WRAPPED[@]}"; do preview_add "$l" "$C_DIM"; done
+}
+draw_preview() {                                       # draw_preview X Y W H
+    local x=$1 y=$2 w=$3 h=$4 i inner p row=0 line
+    inner=$((w - 6))
+    draw_card "$x" "$y" "$w" "$h" "$C_LINE"
+    PREV_LABEL=(); PREV_VALUE=(); PREV_STYLE=()
+    if [ "$VIEW" = projects ] && [ "${#PROJ_VISIBLE[@]}" -gt 0 ]; then
+        p=${PROJ_VISIBLE[$SEL_PROJ]}; human_size "${PROJ_SIZE[$p]}"; encode_folder "${PROJ_FOLDER[$p]}"
+        card_head "$x" "$y" "$w" 'Project' ''
+        wrap_text "${PROJ_FOLDER[$p]}" "$inner"; for line in "${WRAPPED[@]}"; do preview_add "$line" "$C_TITLE"; done
+        preview_rule DETAILS
+        preview_field Chats "${PROJ_COUNT[$p]}"; preview_field 'Last used' "${PROJ_LAST[$p]:0:16}"; preview_field Size "$HUMAN"
+        preview_rule 'CHAT FILES'; preview_body "$PROJECTS_DIR/$ENCODED" "$inner"
+        preview_add ''; preview_add 'Enter or a second click shows only these chats.' "$C_FAINT"
+    elif selected_chat; then
+        i=$SEL; made_in "${CHAT_MADE[$i]}"; short_folder "${CHAT_FOLDER[$i]}"
+        card_head "$x" "$y" "$w" 'Chat' ''
+        wrap_text "${CHAT_TITLE[$i]}" "$inner"; for line in "${WRAPPED[@]}"; do preview_add "$line" "$C_TITLE"; done
+        preview_rule DETAILS
+        preview_field Id "${CHAT_ID[$i]}"; preview_field Folder "$SHORT"; preview_field 'Made in' "$MADE"
+        preview_field Started "${CHAT_FIRST_TS[$i]:0:16}"; preview_field Last "${CHAT_LAST_TS[$i]:0:16}"
+        preview_field Messages "${CHAT_PROMPTS[$i]} from you"; preview_field Size "${CHAT_SIZE_H[$i]}"
+        if [ "${CHAT_DESKTOP[$i]}" = 1 ]; then preview_field Desktop '◆ shown in Claude Desktop'; else preview_field Desktop 'not in Claude Desktop'; fi
+        [ "${CHAT_LINK[$i]}" = 1 ] && preview_field Symlink "↗ $(realpath "${CHAT_PATH[$i]}")"
+        preview_rule 'FIRST MESSAGE'; preview_body "${CHAT_FIRST[$i]}" "$inner"
+        preview_rule 'LAST ANSWER'; preview_body "${CHAT_ANSWER[$i]}" "$inner"
+    else
+        card_head "$x" "$y" "$w" 'Preview' ''
+        preview_add 'Pick a chat to see it here.' "$C_FAINT"
+    fi
+    for ((i = 0; i < ${#PREV_VALUE[@]} && row < h - 2; i++)); do
+        if [ "${PREV_LABEL[$i]}" = "$RULE_MARK" ]; then
+            [ "$row" -gt 0 ] && { draw_rule $((y + 1 + row)) "$x" "$w" "${PREV_VALUE[$i]}" "$C_CHIP_DIM" "$C_LINE"; row=$((row + 1)); }
+        elif [ -n "${PREV_LABEL[$i]}" ]; then
+            draw_text $((y + 1 + row)) $((x + 2)) 10 "${PREV_LABEL[$i]}" "$C_FAINT"
+            draw_text $((y + 1 + row)) $((x + 12)) $((w - 13)) "${PREV_VALUE[$i]}" "${PREV_STYLE[$i]}"
+            row=$((row + 1))
+        else
+            draw_text $((y + 1 + row)) $((x + 2)) $((w - 3)) "${PREV_VALUE[$i]}" "${PREV_STYLE[$i]}"
+            row=$((row + 1))
+        fi
+    done
+    region_add "$x" "$y" $((x + w - 1)) $((y + h - 1)) preview
+}
+draw_topbar() {
+    local spec buttons x tab label style
+    fit '' "$COLS"; at 1 1 "${C_BAR}${FIT}${RESET}"
+    at 1 1 "${C_LOGO} ◆ claude-chats ${RESET}"
+    if [ "$COLS" -ge 112 ]; then buttons='sort:Sort ▾|actions:Actions ▾|preview:Preview|rescan:Rescan|help:? Help|quit:Quit'
+    elif [ "$COLS" -ge 88 ]; then buttons='sort:Sort ▾|actions:Actions ▾|rescan:↻|help:?|quit:Quit'
+    else buttons='actions:Actions ▾|quit:Quit'; fi
+    measure_buttons "$buttons"; x=$((COLS - BUTTONS_W)); [ "$x" -lt 46 ] && x=46
+    draw_buttons 1 "$x" "$COLS" "$buttons"
+    local n=19
+    for spec in 'chats:1 Chats' 'projects:2 Projects' 'tree:3 Folder tree'; do
+        tab=${spec%%:*}; label=" ${spec#*:} "
+        [ $((n + ${#label})) -ge $((x - 1)) ] && break
+        if [ "$VIEW" = "$tab" ]; then style=$C_TAB_ON; else style=$C_TAB; fi
+        at 1 "$n" "${style}${label}${RESET}"
+        region_add "$n" 1 $((n + ${#label} - 1)) 1 "btn:tab_$tab"
+        n=$((n + ${#label} + 1))
+    done
+}
+draw_screen() {
+    update_size; regions_clear; fill_screen
+    draw_topbar
+    case $VIEW in chats) draw_chat_list 1 "$BODY_Y" "$LEFT_W" "$BODY_H" ;; projects) draw_project_list 1 "$BODY_Y" "$LEFT_W" "$BODY_H" ;; tree) draw_tree 1 "$BODY_Y" "$LEFT_W" "$BODY_H" ;; esac
+    [ "$RIGHT_W" -gt 2 ] && draw_preview "$RIGHT_X" "$BODY_Y" "$RIGHT_W" "$BODY_H"
+    draw_status
+    draw_hints 'enter Actions|r Resume|m Move|f Fork|l Symlink|d Desktop|/ Search|w Inside|s Sort|p Preview|tab View|q Quit'
+    flush
+}
+
+# =============================================================================== actions
+
+need_chat() { selected_chat || { STATUS='Pick a chat first.'; return 1; }; }
+rescan() { load_chats; apply_filter; }
+show_result() { if [ "$1" = 0 ]; then rescan; STATUS=$OP_RESULT; else info_wrapped 'That did not work' "$OP_ERROR"; fi; }
+action_resume() {
+    need_chat || return; local i=$SEL folder=${CHAT_FOLDER[$i]}
+    [ -d "$folder" ] || folder=$HOME
+    terminal_restore; printf '\n'
+    (cd "$folder" && claude --resume "${CHAT_ID[$i]}")
+    terminal_setup; rescan
+}
+action_move() {
+    need_chat || return; local i=$SEL
+    pick_folder "Move to which folder? · ${CHAT_TITLE[$i]:0:40}" || return
+    confirm "Move this chat?" "It goes to $PICKED_FOLDER. Its folder paths inside are rewritten, Claude Desktop is updated. Sure?" || return
+    show_loading 'Moving'; move_chat "$i" "$PICKED_FOLDER"; show_result $?
+}
+action_fork() {
+    need_chat || return; local i=$SEL
+    pick_folder "Fork into which folder? · ${CHAT_TITLE[$i]:0:40}" || return
+    show_loading 'Forking'; fork_chat "$i" "$PICKED_FOLDER"; show_result $?
+}
+action_link() {
+    need_chat || return; local i=$SEL
+    pick_folder "Symlink into which folder? · ${CHAT_TITLE[$i]:0:40}" || return
+    show_loading 'Linking'; link_chat "$i" "$PICKED_FOLDER"; show_result $?
+}
+action_desktop() {
+    need_chat || return; local i=$SEL org
+    if [ "${CHAT_DESKTOP[$i]}" = 1 ]; then
+        confirm "Remove from Claude Desktop?" "Only the desktop record goes away, the chat itself stays. Sure?" || return
+        desktop_rm "${CHAT_ID[$i]}"; show_result $?; return
+    fi
+    desktop_org_dirs
+    [ "${#ORG_DIRS[@]}" -gt 0 ] || { info_wrapped 'No Claude Desktop records' "Nothing found under $DESKTOP_DIR. Open Claude Desktop once, start any chat, and try again."; return; }
+    org=${ORG_DIRS[0]}
+    if [ "${#ORG_DIRS[@]}" -gt 1 ]; then
+        PICK_LABELS=(); PICK_IDS=(); for org in "${ORG_DIRS[@]}"; do PICK_LABELS+=("${org#"$DESKTOP_DIR"/}"); PICK_IDS+=("$org"); done
+        picker 'Which Claude Desktop account/organization? (most recently used first)' || return; org=$PICK_ID
+    fi
+    show_loading 'Adding to Claude Desktop'; desktop_add "$i" "$org"; show_result $?
+}
+action_copy_id() { need_chat || return; copy_to_clipboard "${CHAT_ID[$SEL]}"; STATUS="Copied ${CHAT_ID[$SEL]} to the clipboard."; }
+action_paths() {
+    need_chat || return; local i=$SEL record
+    INFO_LINES=("Transcript:  ${CHAT_PATH[$i]}")
+    [ "${CHAT_LINK[$i]}" = 1 ] && INFO_LINES+=("Real file:   $(realpath "${CHAT_PATH[$i]}")")
+    [ -d "${CHAT_PATH[$i]%.jsonl}" ] && INFO_LINES+=("Sidecar dir: ${CHAT_PATH[$i]%.jsonl}")
+    INFO_LINES+=("Project dir: $(dirname "${CHAT_PATH[$i]}")")
+    for record in $(desktop_records_for "${CHAT_ID[$i]}"); do INFO_LINES+=("Desktop:     $record"); done
+    INFO_LINES+=('' "Resume:      cd ${CHAT_FOLDER[$i]:-<folder>} && claude --resume ${CHAT_ID[$i]}")
+    info_box 'File paths'
+}
+action_zed() {
+    need_chat || return
+    info_wrapped 'Open this chat in Zed' \
+        "Zed's Claude agent (ACP) does not import a chat by its id. What works:" '' \
+        "1. Open the folder ${CHAT_FOLDER[$SEL]:-of the chat} in Zed." \
+        "2. Open Zed's terminal and run:  claude --resume ${CHAT_ID[$SEL]}" '' \
+        'Or use Zed: Agent panel > ... > Import Threads (imports every Claude Code chat of the open folder).'
+}
+action_help() {
+    info_wrapped 'Help' \
+        'Mouse: click a chat to select it, click it again or right-click it for the actions menu. Right-click anywhere else (empty space, the top bar, the preview) for the big menu with everything in it. Click a column title to sort by it (again = flip). Scroll with the wheel. Click outside a pop-up to close it.' '' \
+        'Search: type / then words. Normal mode matches the title, the first message, the folder and the id. Press w (or the button) to look INSIDE the chats instead (every word must be in the chat, Enter starts the search, needs rg).' '' \
+        'Views: 1 Chats, 2 Projects (one row per folder, Enter = show only its chats), 3 Folder tree (click a folder to fold it, Enter or right-click = show only its chats). Esc clears the folder filter and the search.' '' \
+        'Actions: r Resume in this terminal, m Move to another folder (rewrites folder paths inside, keeps the id), f Fork (a copy with a new id), l Symlink into another folder (same id works in both), d Show in / remove from Claude Desktop (quit and reopen the app afterwards), c Copy the id, i File paths, z Open in Zed: how.' '' \
+        'Marks on a row: ◆ = shown in Claude Desktop, ↗ = a symlink. Made in: terminal (claude command), desktop (Claude Desktop), sdk/acp (Zed and other editors).' '' \
+        'Keys: s Sort, p Preview on/off, Tab next view, F5 rescan, q Quit.'
+}
+action_sort() {
+    region_find btn:sort; local x=$FOUND_X y=$((FOUND_Y + 1))
+    if [ "$VIEW" = projects ]; then
+        popup_menu "$x" "$y" 'folder:Folder A-Z|chats:Most chats|last:Last used first|size:Biggest first|flip:Flip the order' || return
+        if [ "$MENU_ID" = flip ]; then PROJ_SORT_FLIP=$((1 - PROJ_SORT_FLIP)); else PROJ_SORT_KEY=$MENU_ID; PROJ_SORT_FLIP=0; fi; sort_projects
+    else
+        popup_menu "$x" "$y" 'date:Newest first|title:Title A-Z|project:Project folder|size:Biggest first|msgs:Most messages|made:Where it was made|flip:Flip the order' || return
+        if [ "$MENU_ID" = flip ]; then SORT_FLIP=$((1 - SORT_FLIP)); else SORT_KEY=$MENU_ID; SORT_FLIP=0; fi; apply_filter
+    fi
+}
+sort_by_column() { if [ "$SORT_KEY" = "$1" ]; then SORT_FLIP=$((1 - SORT_FLIP)); else SORT_KEY=$1; SORT_FLIP=0; fi; apply_filter; }
+sort_projects_by() { if [ "$PROJ_SORT_KEY" = "$1" ]; then PROJ_SORT_FLIP=$((1 - PROJ_SORT_FLIP)); else PROJ_SORT_KEY=$1; PROJ_SORT_FLIP=0; fi; sort_projects; }
+chat_menu() {                                          # chat_menu X Y  - the actions pop-up for the selected chat
+    need_chat || return; local desktop_label
+    if [ "${CHAT_DESKTOP[$SEL]}" = 1 ]; then desktop_label='Remove from Claude Desktop'; else desktop_label='Show in Claude Desktop'; fi
+    popup_menu "$1" "$2" "r:Resume in this terminal|m:Move to another folder ...|f:Fork (a copy with a new id) ...|l:Symlink into another folder ...|d:$desktop_label|c:Copy the id|i:Show the file paths|z:Open in Zed: how" || return
+    case $MENU_ID in r) action_resume ;; m) action_move ;; f) action_fork ;; l) action_link ;; d) action_desktop ;; c) action_copy_id ;; i) action_paths ;; z) action_zed ;; esac
+}
+menu_at_selection() {                                  # opens the chat menu next to the selected row (keyboard)
+    case $VIEW in chats) chat_menu 8 $((BODY_Y + 3 + SEL_CHAT - TOP_CHAT)) ;; tree) chat_menu 8 $((BODY_Y + 3 + SEL_TREE - TOP_TREE)) ;; esac
+}
+show_project() { PROJECT_FILTER=$1; VIEW=chats; SEL_CHAT=0; apply_filter; STATUS="Only chats in $1. Esc shows all again."; }
+toggle_fold() { if [ -n "${FOLDED[$1]:-}" ]; then unset "FOLDED[$1]"; else FOLDED[$1]=1; fi; build_tree; }
+view_menu() {                                          # view_menu X Y  - the right-click menu for anything that is not a row: the whole app in one list
+    local preview_label='Hide the preview' inside_label='Search inside the chats'
+    [ "$PREVIEW_SHOWN" = 1 ] || preview_label='Show the preview'
+    [ "$WORDS_INSIDE" = 0 ] || inside_label='Search titles again'
+    popup_menu "$1" "$2" "a:Actions for the selected chat ...|-:|1:Chats|2:Projects|3:Folder tree|-:|/:Search|w:$inside_label|s:Sort ...|p:$preview_label|-:|x:Show all chats again|F:Rescan the chats|?:Help|q:Quit" || return
+    case $MENU_ID in
+        a) menu_at_selection ;;  1) VIEW=chats ;;  2) VIEW=projects ;;  3) VIEW=tree ;;
+        /) SEARCH_MODE=1 ;;  w) toggle_words ;;  s) action_sort ;;  p) PREVIEW_SHOWN=$((1 - PREVIEW_SHOWN)) ;;
+        x) PROJECT_FILTER=''; SEARCH=''; apply_filter; STATUS='Showing all chats.' ;;
+        F) rescan ;;  '?') action_help ;;  q) QUIT=1 ;;
+    esac
+}
+folder_menu() {                                        # folder_menu X Y FOLDER
+    local label='Fold'; [ -n "${FOLDED[$3]:-}" ] && label='Unfold'
+    popup_menu "$1" "$2" "s:Show only the chats in here|f:$label this folder|c:Copy the folder path" || return
+    case $MENU_ID in s) show_project "$3" ;; f) toggle_fold "$3" ;; c) copy_to_clipboard "$3"; STATUS="Copied $3." ;; esac
+}
+activate_row() {                                       # Enter / second click on the current row
+    case $VIEW in
+        chats) menu_at_selection ;;
+        projects) [ "${#PROJ_VISIBLE[@]}" -gt 0 ] && show_project "${PROJ_FOLDER[${PROJ_VISIBLE[$SEL_PROJ]}]}" ;;
+        tree) [ "${#TREE_ROWS[@]}" -gt 0 ] || return 0
+              if [ "${TREE_KIND[$SEL_TREE]}" = folder ]; then show_project "${TREE_KEY[$SEL_TREE]}"; else menu_at_selection; fi ;;
+    esac
+}
+move_selection() {                                     # move_selection DELTA|first|last  (in the current view)
+    local count
+    case $VIEW in chats) local -n selected=SEL_CHAT; count=${#VISIBLE[@]} ;; projects) local -n selected=SEL_PROJ; count=${#PROJ_VISIBLE[@]} ;; *) local -n selected=SEL_TREE; count=${#TREE_ROWS[@]} ;; esac
+    case $1 in first) selected=0 ;; last) selected=$((count - 1)) ;; *) selected=$((selected + $1)) ;; esac
+    clamp "$selected" "$count"; selected=$CLAMPED
+}
+start_search_inside() { show_loading "Looking inside ${#CHAT_PATH[@]} chats for: $SEARCH"; chats_containing "$SEARCH"; apply_filter; STATUS="${#VISIBLE[@]} chats contain: $SEARCH"; }
+toggle_words() { WORDS_INSIDE=$((1 - WORDS_INSIDE)); if [ "$WORDS_INSIDE" = 1 ]; then start_search_inside; else apply_filter; fi; }
+
+main_loop() {
+    local index
+    QUIT=0
+    while :; do
+        [ "$QUIT" = 1 ] && return
+        draw_screen; read_key
+        if [ "$SEARCH_MODE" = 1 ]; then                # typing goes into the search box
+            case $KEY in
+                enter | tab) SEARCH_MODE=0; [ "$WORDS_INSIDE" = 1 ] && start_search_inside; continue ;;
+                esc) SEARCH_MODE=0; SEARCH=''; apply_filter; continue ;;
+                backspace) SEARCH=${SEARCH%?}; [ "$WORDS_INSIDE" = 1 ] || apply_filter; continue ;;
+                up | down | pgup | pgdn | home | end | wheelup | wheeldown | click | rightclick) SEARCH_MODE=0 ;;   # handled below as usual
+                ?) SEARCH+=$KEY; SEL_CHAT=0; [ "$WORDS_INSIDE" = 1 ] || apply_filter; continue ;;
+                *) continue ;;
+            esac
+        fi
+        case $KEY in
+            up) move_selection -1 ;;  down) move_selection 1 ;;  pgup) move_selection -10 ;;  pgdn) move_selection 10 ;;
+            home) move_selection first ;;  end) move_selection last ;;
+            tab | right) case $VIEW in chats) VIEW=projects ;; projects) VIEW=tree ;; *) VIEW=chats ;; esac ;;
+            shifttab | left) case $VIEW in chats) VIEW=tree ;; projects) VIEW=chats ;; *) VIEW=projects ;; esac ;;
+            1) VIEW=chats ;;  2) VIEW=projects ;;  3) VIEW=tree ;;
+            enter) activate_row ;;
+            esc) if [ -n "$PROJECT_FILTER" ] || [ -n "$SEARCH" ]; then PROJECT_FILTER=''; SEARCH=''; apply_filter; STATUS='Showing all chats.'; fi ;;
+            /) SEARCH_MODE=1 ;;  w) toggle_words ;;  s) action_sort ;;  p) PREVIEW_SHOWN=$((1 - PREVIEW_SHOWN)) ;;
+            r) action_resume ;;  m) action_move ;;  f) action_fork ;;  l) action_link ;;  d) action_desktop ;;
+            c) action_copy_id ;;  i) action_paths ;;  z) action_zed ;;  '?') action_help ;;  f5 | F) rescan ;;  q) return ;;
+            wheelup) move_selection -3 ;;  wheeldown) move_selection 3 ;;
+            click | rightclick)
+                region_at "$MOUSE_X" "$MOUSE_Y"; index=${HIT#*:}
+                case $HIT in
+                    btn:tab_chats) VIEW=chats ;;  btn:tab_projects) VIEW=projects ;;  btn:tab_tree) VIEW=tree ;;
+                    btn:sort) action_sort ;;  btn:preview) PREVIEW_SHOWN=$((1 - PREVIEW_SHOWN)) ;;  btn:rescan) rescan ;;
+                    btn:help) action_help ;;  btn:quit) return ;;  btn:words) toggle_words ;;
+                    btn:actions) region_find btn:actions; chat_menu "$FOUND_X" 2 ;;
+                    search) SEARCH_MODE=1 ;;
+                    col:*) sort_by_column "$index" ;;  pcol:*) sort_projects_by "$index" ;;
+                    chat:*) if [ "$KEY" = rightclick ]; then SEL_CHAT=$index; draw_screen; chat_menu "$MOUSE_X" "$MOUSE_Y"
+                            elif [ "$index" = "$SEL_CHAT" ]; then chat_menu "$MOUSE_X" "$MOUSE_Y"; else SEL_CHAT=$index; fi ;;
+                    proj:*) if [ "$index" = "$SEL_PROJ" ] || [ "$KEY" = rightclick ]; then SEL_PROJ=$index; activate_row; else SEL_PROJ=$index; fi ;;
+                    tree:*) SEL_TREE=$index; [ "$KEY" = rightclick ] && draw_screen
+                            if [ "${TREE_KIND[$index]}" = folder ]; then
+                                if [ "$KEY" = rightclick ]; then folder_menu "$MOUSE_X" "$MOUSE_Y" "${TREE_KEY[$index]}"; else toggle_fold "${TREE_KEY[$index]}"; fi
+                            else chat_menu "$MOUSE_X" "$MOUSE_Y"; fi ;;
+                    preview) [ "$KEY" = rightclick ] && chat_menu "$MOUSE_X" "$MOUSE_Y" ;;
+                    *) [ "$KEY" = rightclick ] && view_menu "$MOUSE_X" "$MOUSE_Y" ;;    # right-click on anything else: the whole app in one menu
+                esac ;;
+        esac
+    done
+}
+
+# =============================================================================== command line
+
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+cli_chat() { chat_index_of "$1" || { echo "No chat with id $1 under $PROJECTS_DIR" >&2; exit 1; }; }
+cli_done() { if [ "$1" = 0 ]; then echo "$OP_RESULT"; else echo "$OP_ERROR" >&2; exit 1; fi; }
+cli_list() {
+    local i
+    [ -n "${1:-}" ] && PROJECT_FILTER=${1%/}
+    apply_filter
+    printf '%-16s %-8s %5s %6s  %-36s  %s\n' WHEN 'MADE IN' MSGS SIZE ID 'FOLDER  |  TITLE'
+    for i in "${VISIBLE[@]}"; do
+        made_in "${CHAT_MADE[$i]}"; short_folder "${CHAT_FOLDER[$i]}"
+        printf '%-16s %-8s %5s %6s  %s  %s  |  %s\n' "${CHAT_WHEN[$i]}" "$MADE" "${CHAT_PROMPTS[$i]}" "${CHAT_SIZE_H[$i]}" "${CHAT_ID[$i]}" "$SHORT" "${CHAT_TITLE[$i]}"
+    done
+}
+[ "${BASH_VERSINFO[0]}" -ge 5 ] || { echo "claude-chats needs bash 5 or newer (this is bash $BASH_VERSION)" >&2; exit 1; }   # EPOCHSECONDS
+for tool in gawk jq find sort; do command -v "$tool" >/dev/null || { echo "claude-chats needs $tool" >&2; exit 1; }; done
+[ -d "$PROJECTS_DIR" ] || { echo "No chats found: $PROJECTS_DIR does not exist." >&2; exit 1; }
+case ${1:-} in
+    -h | --help | help) usage ;;
+    list) load_chats; cli_list "${2:-}" ;;
+    move) [ $# = 3 ] || { usage; exit 1; }; load_chats; cli_chat "$2"; move_chat "$CHAT_INDEX" "${3/#\~/$HOME}"; cli_done $? ;;
+    fork) [ $# -ge 2 ] || { usage; exit 1; }; load_chats; cli_chat "$2"; fork_chat "$CHAT_INDEX" "${3:+${3/#\~/$HOME}}"; cli_done $? ;;
+    link) [ $# = 3 ] || { usage; exit 1; }; load_chats; cli_chat "$2"; link_chat "$CHAT_INDEX" "${3/#\~/$HOME}"; cli_done $? ;;
+    desktop-add) [ $# = 2 ] || { usage; exit 1; }; load_chats; cli_chat "$2"; desktop_org_dirs
+                 [ "${#ORG_DIRS[@]}" -gt 0 ] || { echo "No Claude Desktop records under $DESKTOP_DIR" >&2; exit 1; }
+                 desktop_add "$CHAT_INDEX" "${ORG_DIRS[0]}"; cli_done $? ;;
+    desktop-rm) [ $# = 2 ] || { usage; exit 1; }; desktop_rm "$2"; cli_done $? ;;
+    '') [ -t 0 ] && [ -t 1 ] || { echo 'claude-chats needs a terminal (or use: claude-chats list)' >&2; exit 1; }
+        terminal_setup; load_chats; apply_filter; main_loop ;;
+    *) usage; exit 1 ;;
+esac
